@@ -1,0 +1,202 @@
+name: PR-Validate-Sandbox
+
+run-name: "PR-Validate-Sandbox: ${{ github.event.pull_request.head.ref || inputs.head }} -> ${{ github.event.pull_request.base.ref || inputs.base }}"
+
+on:
+  pull_request:
+    types: [opened, synchronize, edited, reopened, ready_for_review]
+    branches:
+      - test
+      - qa
+      - uat
+    paths:
+      - "force-app/**"
+
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Target/base branch"
+        required: true
+        default: "test"
+      head:
+        description: "Source/head branch"
+        required: true
+      sandbox:
+        description: "Sandbox to validate against"
+        required: true
+        type: choice
+        options:
+          - test
+          - qa
+          - uat
+
+env:
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  NO_PROXY: ""
+
+jobs:
+  validate:
+    name: Validate Salesforce Delta Package
+    runs-on: ubuntu-latest
+
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install --global @salesforce/cli
+          sf --version
+
+      - name: Install sfdx-git-delta plugin
+        run: |
+          echo y | sf plugins install sfdx-git-delta
+          sf plugins
+
+      - name: Set branch variables
+        id: vars
+        shell: bash
+        run: |
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          if [ -z "$BASE_BRANCH" ]; then
+            BASE_BRANCH="${{ inputs.base }}"
+          fi
+
+          if [ -z "$HEAD_BRANCH" ]; then
+            HEAD_BRANCH="${{ inputs.head }}"
+          fi
+
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+          echo "head_branch=$HEAD_BRANCH" >> $GITHUB_OUTPUT
+
+          echo "Base branch: $BASE_BRANCH"
+          echo "Head branch: $HEAD_BRANCH"
+
+      - name: Select sandbox auth secret
+        id: auth
+        shell: bash
+        run: |
+          SANDBOX="${{ inputs.sandbox }}"
+
+          if [ -z "$SANDBOX" ]; then
+            SANDBOX="${{ github.event.pull_request.base.ref }}"
+          fi
+
+          echo "Sandbox selected: $SANDBOX"
+
+          if [ "$SANDBOX" = "test" ]; then
+            echo "auth_secret=SFDX_AUTH_URL_TEST" >> $GITHUB_OUTPUT
+            echo "alias=test" >> $GITHUB_OUTPUT
+          elif [ "$SANDBOX" = "qa" ]; then
+            echo "auth_secret=SFDX_AUTH_URL_QA" >> $GITHUB_OUTPUT
+            echo "alias=qa" >> $GITHUB_OUTPUT
+          elif [ "$SANDBOX" = "uat" ]; then
+            echo "auth_secret=SFDX_AUTH_URL_UAT" >> $GITHUB_OUTPUT
+            echo "alias=uat" >> $GITHUB_OUTPUT
+          else
+            echo "Invalid sandbox selected: $SANDBOX"
+            exit 1
+          fi
+
+      - name: Authenticate to TEST sandbox
+        if: steps.auth.outputs.auth_secret == 'SFDX_AUTH_URL_TEST'
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL_TEST }}" > SFDX_AUTH_URL.txt
+          sf org login sfdx-url --sfdx-url-file SFDX_AUTH_URL.txt --alias test --set-default
+
+      - name: Authenticate to QA sandbox
+        if: steps.auth.outputs.auth_secret == 'SFDX_AUTH_URL_QA'
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL_QA }}" > SFDX_AUTH_URL.txt
+          sf org login sfdx-url --sfdx-url-file SFDX_AUTH_URL.txt --alias qa --set-default
+
+      - name: Authenticate to UAT sandbox
+        if: steps.auth.outputs.auth_secret == 'SFDX_AUTH_URL_UAT'
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL_UAT }}" > SFDX_AUTH_URL.txt
+          sf org login sfdx-url --sfdx-url-file SFDX_AUTH_URL.txt --alias uat --set-default
+
+      - name: Verify authenticated org
+        run: |
+          sf org display --target-org ${{ steps.auth.outputs.alias }}
+
+      - name: Create delta package
+        shell: bash
+        run: |
+          BASE_BRANCH="${{ steps.vars.outputs.base_branch }}"
+          HEAD_BRANCH="${{ steps.vars.outputs.head_branch }}"
+
+          echo "Fetching branches..."
+          git fetch origin $BASE_BRANCH
+          git fetch origin $HEAD_BRANCH
+
+          echo "Checking out head branch..."
+          git checkout $HEAD_BRANCH
+
+          mkdir -p changed-sources
+
+          echo "Generating delta from origin/$BASE_BRANCH to HEAD..."
+          sf sgd source delta \
+            --to HEAD \
+            --from origin/$BASE_BRANCH \
+            --output changed-sources \
+            --generate-delta \
+            --source force-app
+
+          echo "Delta package created:"
+          ls -R changed-sources
+
+      - name: Show package.xml
+        run: |
+          if [ -f changed-sources/package/package.xml ]; then
+            cat changed-sources/package/package.xml
+          else
+            echo "No package.xml generated. No metadata changes found."
+          fi
+
+      - name: Show destructiveChanges.xml
+        run: |
+          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
+            cat changed-sources/destructiveChanges/destructiveChanges.xml
+          else
+            echo "No destructive changes found."
+          fi
+
+      - name: Check if package has changes
+        id: package_check
+        shell: bash
+        run: |
+          if [ -f changed-sources/package/package.xml ] && grep -q "<types>" changed-sources/package/package.xml; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Metadata changes found."
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No metadata changes found."
+          fi
+
+      - name: Validate deployment - check only
+        if: steps.package_check.outputs.has_changes == 'true'
+        run: |
+          sf project deploy validate \
+            --manifest changed-sources/package/package.xml \
+            --target-org ${{ steps.auth.outputs.alias }} \
+            --test-level RunLocalTests \
+            --wait 60 \
+            --verbose
+
+      - name: Skip validation when no changes
+        if: steps.package_check.outputs.has_changes == 'false'
+        run: |
+          echo "No Salesforce metadata changes detected. Skipping validation."
